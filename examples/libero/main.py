@@ -11,11 +11,18 @@ from libero.libero.envs import OffScreenRenderEnv
 import numpy as np
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
+from scipy.spatial.transform import Rotation as R
 import tqdm
 import tyro
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
+LIBERO_ACTION_CLIP = 1.0
+LIBERO_POSITION_GAIN = 4.0
+LIBERO_POSE_INPUT_MIN = -np.ones(6, dtype=np.float32)
+LIBERO_POSE_INPUT_MAX = np.ones(6, dtype=np.float32)
+LIBERO_POSE_OUTPUT_MIN = -np.array([0.05, 0.05, 0.05, 0.5, 0.5, 0.5], dtype=np.float32)
+LIBERO_POSE_OUTPUT_MAX = np.array([0.05, 0.05, 0.05, 0.5, 0.5, 0.5], dtype=np.float32)
 
 
 @dataclasses.dataclass
@@ -110,10 +117,12 @@ def eval_libero(args: Args) -> None:
                         t += 1
                         continue
 
-                    # Get preprocessed image
-                    # IMPORTANT: rotate 180 degrees to match train preprocessing
-                    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-                    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                    # Get preprocessed image.
+                    # Rotation is disabled here to match the raw single-camera training data.
+                    # img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+                    # wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                    img = np.ascontiguousarray(obs["agentview_image"])
+                    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"])
                     img = image_tools.convert_to_uint8(
                         image_tools.resize_with_pad(img, args.resize_size, args.resize_size)
                     )
@@ -130,24 +139,24 @@ def eval_libero(args: Args) -> None:
                         element = {
                             "observation/image": img,
                             "observation/wrist_image": wrist_img,
-                            "observation/state": np.concatenate(
-                                (
-                                    obs["robot0_eef_pos"],
-                                    _quat2axisangle(obs["robot0_eef_quat"]),
-                                    obs["robot0_gripper_qpos"],
-                                )
-                            ),
+                            # Temporary workaround for zero-state checkpoints: keep the incoming
+                            # state shape consistent with the 7D training stats.
+                            "observation/state": np.zeros(7, dtype=np.float32),
                             "prompt": str(task_description),
                         }
 
-                        # Query model to get action
-                        action_chunk = client.infer(element)["actions"]
+                        # Query model to get action and log policy inference time.
+                        infer_result = client.infer(element)
+                        infer_ms = infer_result.get("policy_timing", {}).get("infer_ms")
+                        if infer_ms is not None:
+                            logging.info(f"pi0 policy infer time: {infer_ms:.2f} ms")
+                        action_chunk = infer_result["actions"]
                         assert (
                             len(action_chunk) >= args.replan_steps
                         ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
                         action_plan.extend(action_chunk[: args.replan_steps])
 
-                    action = action_plan.popleft()
+                    action = _action_to_libero(action_plan.popleft())
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
@@ -212,6 +221,49 @@ def _quat2axisangle(quat):
         return np.zeros(3)
 
     return (quat[:3] * 2.0 * math.acos(quat[3])) / den
+
+
+def _inverse_scale_pose_delta(
+    pose_delta,
+    *,
+    input_min=LIBERO_POSE_INPUT_MIN,
+    input_max=LIBERO_POSE_INPUT_MAX,
+    output_min=LIBERO_POSE_OUTPUT_MIN,
+    output_max=LIBERO_POSE_OUTPUT_MAX,
+    action_clip=LIBERO_ACTION_CLIP,
+):
+    pose_delta = np.asarray(pose_delta, dtype=np.float32)
+    denom = output_max - output_min
+    safe = np.where(np.abs(denom) < 1e-8, 1.0, denom)
+    scaled = (pose_delta - output_min) / safe
+    cmd = scaled * (input_max - input_min) + input_min
+    cmd = np.clip(cmd, input_min, input_max)
+    cmd = np.clip(cmd, -action_clip, action_clip)
+    return cmd.astype(np.float32)
+
+
+def _action_to_libero(action):
+    """Convert model-predicted state deltas into LIBERO OSC_POSE controller commands."""
+    action = np.asarray(action, dtype=np.float32).copy()
+    dpos = action[:3] * LIBERO_POSITION_GAIN
+    deuler = action[3:6]
+    dwidth = float(action[6])
+
+    # The dataset stores relative rotation as Euler XYZ deltas; robosuite OSC_POSE expects a rotvec.
+    drotvec = R.from_euler("xyz", deuler).as_rotvec().astype(np.float32)
+    pose_delta = np.concatenate([dpos, drotvec], axis=0).astype(np.float32)
+    cmd_pose = _inverse_scale_pose_delta(pose_delta)
+
+    # Dataset gripper action is delta finger width: positive opens, negative closes.
+    if abs(dwidth) < 1e-6:
+        cmd_gripper = 0.0
+    else:
+        cmd_gripper = float(-np.sign(dwidth))
+
+    cmd = np.concatenate([cmd_pose, np.array([cmd_gripper], dtype=np.float32)], axis=0)
+    if np.any(np.isnan(cmd)):
+        raise ValueError(f"NaN in converted action. input={action}, converted={cmd}")
+    return cmd
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.libero_raw_policy as libero_raw_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -86,6 +87,11 @@ class DataConfig:
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
+
+    # Local DINO-WM-style npy dataset directory. If set, the torch data loader reads this directory instead of
+    # constructing a LeRobotDataset from repo_id.
+    local_dataset_dir: str | None = None
+    local_episode_indices: tyro.conf.Suppress[tuple[int, ...] | None] = None
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
@@ -352,6 +358,69 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotLiberoRawDataConfig(DataConfigFactory):
+    """Config for a single-camera 7D LIBERO dataset stored in LeRobot format."""
+
+    zero_state_input: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[libero_raw_policy.LiberoRawInputs(model_type=model_config.model_type)],
+            outputs=[libero_raw_policy.LiberoRawOutputs(action_dim=7)],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+        if self.zero_state_input:
+            model_transforms = model_transforms.push(inputs=[libero_raw_policy.ZeroState()])
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class DinoWmNpyDataConfig(DataConfigFactory):
+    """Config for DINO-WM-style npy exports with 7D Cartesian-delta actions."""
+
+    local_dataset_dir: str = tyro.MISSING
+    episode_indices: tyro.conf.Suppress[tuple[int, ...] | None] = None
+    default_prompt: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[libero_raw_policy.LiberoRawInputs(model_type=model_config.model_type)],
+            outputs=[libero_raw_policy.LiberoRawOutputs(action_dim=7)],
+        )
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            local_dataset_dir=self.local_dataset_dir,
+            local_episode_indices=self.episode_indices,
         )
 
 
@@ -760,6 +829,77 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_libero_raw_delta_xyz_base_224",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+        data=LeRobotLiberoRawDataConfig(
+            repo_id="yang/libero_raw_delta_xyz_base_224",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_lora_libero_raw_delta_xyz_base_224",
+        model=pi0_config.Pi0Config(
+            action_horizon=50,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoRawDataConfig(
+            repo_id="yang/libero_raw_delta_xyz_base_224",
+            assets=AssetsConfig(
+                assets_dir="./assets/pi05_libero_raw_delta_xyz_base_224",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            zero_state_input=True,
+            # zero_state_input=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=150_000,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_lora_shared_account_cartesian_delta",
+        model=pi0_config.Pi0Config(
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=DinoWmNpyDataConfig(
+            repo_id="shared_account_dinowm_224",
+            local_dataset_dir="/home/yang/shared_account_dinowm_224",
+            episode_indices=tuple(range(35)),
+            default_prompt="pick_place",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=600_000,
+        batch_size=32,
+        num_workers=0,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
     ),
     #
     # Fine-tuning Aloha configs.

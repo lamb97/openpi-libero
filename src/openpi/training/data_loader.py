@@ -1,7 +1,10 @@
+import bisect
 from collections.abc import Iterator, Sequence
+import json
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -127,6 +130,113 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+class DinoWmNpyDataset(Dataset):
+    """Reads DINO-WM style npy exports as OpenPI training samples.
+
+    Expected layout:
+      - states.npy: [episodes, max_len, state_dim] or [total_frames, state_dim]
+      - actions.npy: [episodes, max_len, action_dim] or [total_frames, action_dim]
+      - seq_lengths.npy: [episodes]
+      - obses_npy/episode_000000.npy, ...: per-episode image arrays
+    """
+
+    def __init__(
+        self, data_dir: str | pathlib.Path, action_horizon: int, episode_indices: Sequence[int] | None = None
+    ):
+        self._data_dir = pathlib.Path(data_dir)
+        self._action_horizon = action_horizon
+        self._states = np.load(self._data_dir / "states.npy", mmap_mode="r")
+        self._actions = np.load(self._data_dir / "actions.npy", mmap_mode="r")
+        self._all_seq_lengths = np.asarray(np.load(self._data_dir / "seq_lengths.npy"), dtype=np.int64)
+        self._episode_indices = list(episode_indices) if episode_indices is not None else list(range(len(self._all_seq_lengths)))
+        if not self._episode_indices:
+            raise ValueError("DinoWmNpyDataset requires at least one episode.")
+        if min(self._episode_indices) < 0 or max(self._episode_indices) >= len(self._all_seq_lengths):
+            raise ValueError(
+                f"Episode indices must be in [0, {len(self._all_seq_lengths) - 1}], got {self._episode_indices}"
+            )
+        self._seq_lengths = self._all_seq_lengths[self._episode_indices]
+        self._all_offsets = np.concatenate([[0], np.cumsum(self._all_seq_lengths)])
+        self._offsets = np.concatenate([[0], np.cumsum(self._seq_lengths)])
+        self._is_flat = self._states.ndim == 2
+
+        if self._actions.ndim != self._states.ndim:
+            raise ValueError(f"states/actions rank mismatch: {self._states.shape=} {self._actions.shape=}")
+        if self._is_flat and len(self._states) < self._all_offsets[-1]:
+            raise ValueError(
+                f"Flat states.npy is shorter than seq_lengths sum: {len(self._states)} < {self._all_offsets[-1]}"
+            )
+        if self._is_flat and len(self._actions) < self._all_offsets[-1]:
+            raise ValueError(
+                f"Flat actions.npy is shorter than seq_lengths sum: {len(self._actions)} < {self._all_offsets[-1]}"
+            )
+        if not self._is_flat and self._states.shape[0] != len(self._all_seq_lengths):
+            raise ValueError(
+                f"Padded states.npy episode count does not match seq_lengths: {self._states.shape[0]} != "
+                f"{len(self._all_seq_lengths)}"
+            )
+        if not self._is_flat and self._actions.shape[0] != len(self._all_seq_lengths):
+            raise ValueError(
+                f"Padded actions.npy episode count does not match seq_lengths: {self._actions.shape[0]} != "
+                f"{len(self._all_seq_lengths)}"
+            )
+
+        obs_dir = self._data_dir / "obses_npy"
+        self._obs = [
+            np.load(obs_dir / f"episode_{ep_idx:06d}.npy", mmap_mode="r") for ep_idx in self._episode_indices
+        ]
+        self._prompts = self._load_prompts()
+
+    def _load_prompts(self) -> list[str]:
+        prompts = {ep_idx: "pick_place" for ep_idx in self._episode_indices}
+        meta_path = self._data_dir / "episode_meta.jsonl"
+        if not meta_path.exists():
+            return [prompts[ep_idx] for ep_idx in self._episode_indices]
+        with meta_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                ep_idx = int(item["converted_index"])
+                if ep_idx in prompts:
+                    prompts[ep_idx] = item.get("task") or prompts[ep_idx]
+        return [prompts[ep_idx] for ep_idx in self._episode_indices]
+
+    def _episode_slice(self, array: np.ndarray, ep_idx: int, start: int, stop: int) -> np.ndarray:
+        if self._is_flat:
+            offset = int(self._all_offsets[ep_idx])
+            return np.asarray(array[offset + start : offset + stop])
+        return np.asarray(array[ep_idx, start:stop])
+
+    def _episode_item(self, array: np.ndarray, ep_idx: int, frame_idx: int) -> np.ndarray:
+        if self._is_flat:
+            return np.asarray(array[int(self._all_offsets[ep_idx]) + frame_idx])
+        return np.asarray(array[ep_idx, frame_idx])
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        frame_global_idx = index.__index__()
+        selected_ep_idx = bisect.bisect_right(self._offsets, frame_global_idx) - 1
+        source_ep_idx = self._episode_indices[selected_ep_idx]
+        frame_idx = frame_global_idx - int(self._offsets[selected_ep_idx])
+        ep_len = int(self._seq_lengths[selected_ep_idx])
+
+        action_stop = min(frame_idx + self._action_horizon, ep_len)
+        actions = self._episode_slice(self._actions, source_ep_idx, frame_idx, action_stop)
+        if len(actions) < self._action_horizon:
+            pad = np.repeat(actions[-1:], self._action_horizon - len(actions), axis=0)
+            actions = np.concatenate([actions, pad], axis=0)
+
+        return {
+            "observation/image": np.asarray(self._obs[selected_ep_idx][frame_idx]),
+            "observation/state": self._episode_item(self._states, source_ep_idx, frame_idx).astype(np.float32),
+            "actions": actions.astype(np.float32),
+            "prompt": np.asarray(self._prompts[selected_ep_idx]),
+        }
+
+    def __len__(self) -> int:
+        return int(self._offsets[-1])
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -136,6 +246,8 @@ def create_torch_dataset(
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
+    if data_config.local_dataset_dir is not None:
+        return DinoWmNpyDataset(data_config.local_dataset_dir, action_horizon, data_config.local_episode_indices)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
