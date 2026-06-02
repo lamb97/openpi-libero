@@ -919,6 +919,30 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
+    TrainConfig(
+        # LoRA finetune pi0 base on combined UR5 diffusion-policy zarr replay buffers
+        # (0501_bowl + 0519_penCase + 0521_bowlBox), converted to DinoWmNpy format via
+        # scripts/convert_ur5_dp_zarr_to_dinowm_npy.py. State/action layout:
+        # state  = ee_xyz(3) + ee_rpy(3) + gripper(1)
+        # action = delta_xyz(3) + delta_rpy(3) + gripper(1)
+        name="pi0_lora_ur5_dp_combined_delta_xyz",
+        model=pi0_config.Pi0Config(
+            action_horizon=30,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=DinoWmNpyDataConfig(
+            repo_id="ur5_dp_combined_dinowm_npy_dryrun",
+            local_dataset_dir="/home/riftuser/datasets/ur5_dp_combined_dinowm_npy_dryrun",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=650_000,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
     #
     # Fine-tuning Aloha configs.
     #
